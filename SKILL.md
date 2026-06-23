@@ -9,8 +9,11 @@ description: >-
   Access Tokens / Privacy Pass). Use when triaging which anti-bot vendor/shape a site uses,
   deobfuscating an anti-bot SDK (string-array OR VM/control-flow obfuscation), cracking a WASM
   challenge, recovering a sensor cookie/token, identifying a PAT/attestation scheme, reproducing or
-  rendering a hard fingerprint surface (canvas, WebGL/shaders, audio) from a real browser, or
-  judging the attacker capability and architecture needed to automate a protected site.
+  rendering a hard fingerprint surface (canvas, WebGL/shaders, audio) from a real browser, judging the
+  attacker capability needed to automate a protected site, or designing and building an end-to-end
+  bypass system (recon -> profile -> tiered runner -> transport/scale) gated on a ground-truth golden
+  trace. Reach for this whenever a site is protected by an invisible bot wall, a CAPTCHA-less SDK, a
+  WASM/JS challenge, or a fingerprint/attestation check, even if the user does not name the vendor.
 ---
 
 # Anti-bot recon & bypass assessment
