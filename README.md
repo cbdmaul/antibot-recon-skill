@@ -13,8 +13,20 @@ control.
 
 ## What it is
 
-The skill is a single `SKILL.md` with YAML frontmatter (`name`, `description`) and a Markdown body.
-Claude reads the `description` to decide when the skill is relevant, then follows the body.
+A multi-document skill. `SKILL.md` is the spine: the universal model, the core principles, and a
+**phased pipeline** where each phase produces a named artifact that fills out one project layout
+(triage → evaluation gate → decompose → profile → build → orthogonal axes → verify). Depth for each
+phase lives in `references/`, loaded only when that phase is reached:
+
+- `references/triage.md` — Phase 1 triage and the recon subagent team
+- `references/attestation.md` — PAT / Privacy Pass and hardware-attestation reasoning
+- `references/decompose.md` — JS deobfuscation and WASM analysis
+- `references/surfaces.md` — hard fingerprint surfaces and behavioral collection
+- `references/architecture.md` — credential ladder, orthogonal axes, and the code layout
+- `references/evaluation-gate.md` — golden trace and negative control
+
+Claude reads the `description` to decide when the skill is relevant, then follows `SKILL.md`, pulling in
+references as each phase needs them.
 
 ## Install
 
