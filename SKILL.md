@@ -7,7 +7,8 @@ description: >-
   cookie systems (DataDome `datadome`, Akamai `_abck`/`bm_sz`, Imperva `reese84`, PerimeterX/HUMAN
   `_px`), proof-of-work challenges, and passive behavioral scoring. Use when triaging which
   anti-bot vendor/shape a site uses, deobfuscating an anti-bot SDK (string-array OR VM/control-flow
-  obfuscation), cracking a WASM challenge, recovering a sensor cookie/token, reproducing or rendering a hard
+  obfuscation), cracking a WASM challenge, recovering a sensor cookie/token, identifying an
+  attestation-token scheme (Private Access Tokens / Privacy Pass), reproducing or rendering a hard
   fingerprint surface (canvas, WebGL/shaders, audio) from a real browser, or judging the attacker
   capability needed to automate a protected site.
 ---
@@ -34,7 +35,10 @@ varies, and that variation is what you must identify before committing to an app
    - a **cookie** set on the sensor response (DataDome `datadome`, Akamai `_abck`/`bm_sz`,
      Imperva `reese84`/`incap_ses`, PerimeterX/HUMAN `_px3`, Cloudflare `cf_clearance`);
    - or **nothing explicit** — a passive *risk score* the server keeps per session/IP, gated only
-     on the telemetry you keep sending.
+     on the telemetry you keep sending;
+   - or an **attestation token** minted by a trusted issuer rather than computed in the page (Private
+     Access Tokens / Privacy Pass; an HTTP `WWW-Authenticate: PrivateToken` challenge). Its strength
+     is the issuer's, not the page's — see the attestation section.
 4. **Attach the credential** to protected requests (header / cookie / query param / form field),
    which the origin or edge validates and/or re-scores.
 
@@ -76,6 +80,50 @@ Classify against the table, then pick your path.
 | **hCaptcha / reCAPTCHA / Turnstile** | token | form field / header | iframe + behavioral/PoW | visible or invisible |
 
 (Vendors rename and re-shape constantly — use the table as a recognition aid, confirm by triage.)
+
+## Attestation tokens (Private Access Tokens / Privacy Pass)
+
+Some sites do not fingerprint at all. They accept an *attestation token* minted by a trusted issuer —
+the Private Access Token / Privacy Pass family (Apple devices, Cloudflare and Fastly as issuers, the
+PACT proposal). This is a different shape from everything else here and it changes the whole strategy,
+so catch it in triage before you build any fingerprint machinery.
+
+**Identify it.**
+- The server answers a protected request with an HTTP auth challenge: `WWW-Authenticate: PrivateToken
+  challenge=…, token-key=…`, and the client returns `Authorization: PrivateToken token=…`.
+- The token is fetched from an *issuer* (a CDN such as Cloudflare/Fastly, or a platform), not computed
+  in the page. There is little or no JS sensor, no canvas/WebGL/audio probing, no behavioral beacon.
+- On Apple platforms the OS handles it transparently with no UI. It is usually offered as a way to
+  *skip a CAPTCHA*, so it sits next to a CAPTCHA/fingerprint fallback rather than replacing it.
+
+**The issuer is the real gate — three cases, cheapest first.** A token is only as strong as the
+issuer's attestation, so decide which case you are in:
+- **PAT is optional (an accelerator).** The site still accepts the fallback path: solve the CAPTCHA,
+  or pass the fingerprint/JS challenge on the C-ladder. Ignore the token and take the fallback; confirm
+  with the negative control that the fallback is accepted.
+- **The issuer's attestation is software-grade.** A CDN or identity-provider issuer with no device
+  root of trust falls back on fingerprinting, account history, or a CAPTCHA to decide whether to sign.
+  The real target is then the issuer's own check — recurse: triage *that* step and defeat it on the
+  C-ladder. The PAT wrapper adds nothing new.
+- **The issuer requires hardware attestation.** Apple's PAT signs only after the Secure Enclave attests
+  the device, with an Apple account in good standing involved; Android's analog is hardware-backed key
+  attestation / Play Integrity. There is no value to synthesize and no call site to hook. The token is
+  produced by a hardware root of trust you do not control.
+
+**When it is hardware-backed, real hardware is the requirement.** This is the one branch where piloting
+a browser does not help, because the attestation is rooted in the device, not the page.
+- **Use a genuine attested device** in good account standing. One real iPhone/Mac (or attested
+  Android) mints tokens; a pool of them is the device-farm analog of a browser farm.
+- **Scale is expensive and accountable.** Tokens bind to a device and an account the issuer can
+  rate-limit, age-check, and revoke. Rotating identity means rotating real, provisioned,
+  account-bound devices, not spinning a process. Cost jumps from "a real browser" to "a real,
+  accountable device" — the strongest economic bar in this document.
+- **Do not try to forge it.** Faking Secure Enclave / Play Integrity attestation is a platform
+  root-of-trust exploit, out of scope for recon. If the device root of trust holds, the token cannot
+  be produced off-device.
+
+So: in triage, decide optional vs software-grade vs hardware-backed. That call is the difference
+between "no browser needed," "defeat the issuer's check on the C-ladder," and "real devices needed."
 
 ## Phase B — The universal strategy: pilot the genuine client
 
@@ -273,6 +321,11 @@ further.
 | C2 | device fingerprint required, **static** challenge input | inject a captured real profile | profile store + emulated runner |
 | C3 | **dynamic** per-session challenge, real-GPU FP | render the hard surface live | real-browser oracle (hybrid) or full pilot |
 | C4 | behavioral scoring or automation detection that **gates** the credential | supply plausible behavior, hide hooks | behavior engine + stealthed real browser |
+
+Attestation tokens (PAT / Privacy Pass) are not a C-tier. They are a separate branch: a hardware-backed
+issuer (Apple Secure Enclave, Android Play Integrity) needs a real attested device, not a browser,
+while an optional or software-grade one drops back to a fallback or to the issuer's own check. See the
+attestation section, and make the call in triage.
 
 **Two orthogonal axes — add only if recon shows them, at whatever credential tier you are on.** These
 are not higher tiers. They are usually cheap, and either one can be the *entire* defense.
