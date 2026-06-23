@@ -189,6 +189,41 @@ stale and you need a live real engine per request. If the input is static, captu
 replay. Make this determination early, with the negative control, because it sets whether you are
 running a browser per request or just a one-time capture.
 
+## Identifying behavioral signal collection
+
+Behavioral scoring watches how a user moves, types, and touches. It is the other collection branch
+next to the device fingerprint, and you recognize and rate it the same way.
+
+**Find the listeners (static).** In the deobfuscated loader, look for `addEventListener` (or `on*`
+handlers) on `document` / `window` / `body` for: `mousemove`, `mousedown`/`mouseup`, `click`,
+`wheel`, `scroll`, `keydown`/`keyup`/`keypress`, `pointer*`, `touchstart`/`touchmove`/`touchend`,
+`devicemotion`, `deviceorientation`, `focus`/`blur`, `visibilitychange`. Trace each listener to the
+buffer it appends to, and that buffer to the field it serializes into the sensor payload.
+
+**Confirm at runtime (dynamic).** Wrap `EventTarget.prototype.addEventListener` (log type + target)
+before the SDK loads, or read `getEventListeners(document)` in DevTools. Then interact and diff the
+sensor payload: move the mouse, type, scroll, and watch which bytes grow. The fields that change
+under interaction are the behavioral channel.
+
+**Watch the beacon.** Behavioral telemetry is batched and shipped on a timer or on
+`visibilitychange`/`beforeunload`, often via `navigator.sendBeacon` or a periodic `fetch`/XHR with an
+encoded body. A payload that grows with interaction and flushes periodically is the signature.
+
+**Rate it on two axes.** (1) *What is captured* — raw event streams (x, y, t per move; key dwell and
+flight times; touch radius/pressure; scroll cadence; idle gaps) versus coarse aggregates (counts,
+entropy, presence flags). Raw streams are harder to fake convincingly. (2) *Does it gate the
+credential* — produce the credential with **zero** behavioral input and run the negative control. If
+it still passes, behavior is a soft server-side score you can defer; if it blocks, you must supply
+plausible behavior. (TrustSig collected pointer/keyboard/touch in the loader but did not gate the
+token on it; many vendors only score it server-side.)
+
+**Synthesis difficulty.** Convincing behavior is a distribution-matching problem, not a value to
+copy. Cheapest first: ignore it if it does not gate; replay recorded real human sessions, rescaled
+and retimed to the page; generate physics- or Bézier-based mouse paths with human key/touch timing;
+or pilot a real browser and drive synthetic-but-plausible events through it so the rest of the
+fingerprint stays authentic. Interactive challenges (slider, click-the-images) are the same signal
+under a controlled task, with a perception problem stacked on top of the motion problem.
+
 ## The decisive constraint (why a real engine is the cheap path)
 
 Fingerprint reads are commonly synchronous and must *be* a real engine's; software renderers and
@@ -218,6 +253,91 @@ positive.
   (`curl-impersonate` / `utls` / `tls-client`) and header order.
 - Fidelity (offline path): `@napi-rs/canvas` (Skia), `node-web-audio-api` — note these emit the
   *library's* fingerprint, not a browser's.
+
+## From recon to a system: complexity ladder and architecture
+
+The recon output is a per-target *profile*: the credential, its transport, the endpoints, which
+device surfaces and behaviors are checked, and whether each is **static or dynamic**. That profile
+drives one decision — how much real browser you must spend per request. Build the system around that
+decision, not around a single technique.
+
+**Complexity ladder (vendor defense observed → what the system must do).** Each tier is a superset of
+the ones below. Find your target's highest checked tier in recon, build up to it, and no further.
+
+| Tier | Defense observed in recon | What the system must do | Component |
+|---|---|---|---|
+| L0 | static credential, no JS | send the credential | HTTP client + credential cache |
+| L1 | credential derived by simple JS, no hardware FP | run the derivation offline | JS-sandbox runner (`mini-racer`/node `vm`) |
+| L2 | device fingerprint required, **static** challenge input | inject a captured real profile | profile store + emulated runner |
+| L3 | **dynamic** per-session challenge, real-GPU FP | render the hard surface live | real-browser oracle (hybrid) or full pilot |
+| L4 | behavioral scoring and/or automation detection | supply plausible behavior, hide hooks | behavior engine + stealthed real browser |
+| L5 | origin binding + TLS/JA3 + header order + rate-limit/clustering | distribute over real browsers on the allowed origin, rotate identities | browser pool + proxy/profile rotation + browser-TLS |
+
+**Decision flow (per request).**
+
+```
+ recon profile
+      │
+      ▼
+ credential static? ───────────────yes──► HTTP replay                      (L0/L1)
+      │ no
+      ▼
+ device FP needed? ────────────────no───► JS-sandbox derive                (L1)
+      │ yes
+      ▼
+ challenge input dynamic? ─────────no───► emulated runner + captured FP    (L2)
+      │ yes
+      ▼
+ behavior / automation scored? ───no───► real-browser render or pilot      (L3)
+      │ yes
+      ▼
+ real browser + behavior engine + stealth                                  (L4)
+      │
+      ▼  (always, for scale + origin/TLS binding)
+ assign device profile + proxy from pool; keep the credential step and the
+ protected request in one context                                          (L5)
+      │
+      ▼
+ control harness verifies acceptance ──BLOCK──► escalate tier / rotate profile / re-capture / re-triage
+```
+
+**Code layout.**
+
+```
+antibot-defeat/
+  recon/                        # per-target, one-time; output is the profile below
+    triage.json                 # credential, transport, endpoints, vendor shape
+    deobf/                      # structural JS passes (string-array; VM/control-flow)
+    wasm/                       # extract tables by execution; decompile; probe inventory
+    surfaces.json               # device surfaces + behaviors checked, each static|dynamic
+  targets/<vendor>/profile.json # the contract the runtime consumes
+  core/
+    orchestrator/               # reads profile, picks the tier/runner per request
+    runners/
+      http/                     # L0-L1: replay + JS-sandbox credential derivation
+      emulated/                 # L2: offline client with injected captured fingerprint
+      browser/                  # L3-L5: real-browser pilot and rendering oracle
+    fingerprint/                # capture, consistency-check, and serve device profiles
+    behavior/                   # mouse/key/touch synthesis and human-session replay
+    challenge/                  # parse the server challenge; route hard surfaces to the oracle
+    transport/                  # TLS-impersonation, header-order, proxy rotation
+  pool/                         # warm real(-GPU) browsers; bind profile + proxy per session
+  control/                      # negative-control + acceptance verification, run continuously
+  store/                        # captured profiles, recorded sessions, single-use credential cache
+```
+
+**Design rules that fall out of the recon.**
+
+- The orchestrator is profile-driven. Adding a vendor is writing a new `profile.json`, not new
+  control flow.
+- Whenever a tier uses a real browser, keep the credential step and the protected request in one
+  context so `Origin`, cookies, and TLS/JA3 are the engine's for free.
+- Treat single-use nonces as a cache-invalidation rule: one credential per protected request, never
+  replayed.
+- The control harness is a runtime component, not a one-off test. Acceptance drift is how you learn
+  the vendor shipped a new build, which re-triggers recon for that target.
+- Cost scales with tier. L0-L2 are cheap and parallel; L3+ spends a real browser. Hold each target at
+  the lowest tier its profile allows, and re-evaluate when a rebuild changes the profile.
 
 ## What you'll conclude
 
