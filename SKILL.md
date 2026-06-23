@@ -7,8 +7,9 @@ description: >-
   cookie systems (DataDome `datadome`, Akamai `_abck`/`bm_sz`, Imperva `reese84`, PerimeterX/HUMAN
   `_px`), proof-of-work challenges, and passive behavioral scoring. Use when triaging which
   anti-bot vendor/shape a site uses, deobfuscating an anti-bot SDK (string-array OR VM/control-flow
-  obfuscation), cracking a WASM challenge, recovering a sensor cookie/token, reproducing a
-  fingerprint surface, or judging the attacker capability needed to automate a protected site.
+  obfuscation), cracking a WASM challenge, recovering a sensor cookie/token, reproducing or rendering a hard
+  fingerprint surface (canvas, WebGL/shaders, audio) from a real browser, or judging the attacker
+  capability needed to automate a protected site.
 ---
 
 # Anti-bot platform recon & bypass assessment
@@ -102,8 +103,8 @@ every target has WASM, a challenge, or a token.
 
 - **C1 · Deobfuscate the client JS, structurally.** Two families: **(a) commodity string-array**
   (obfuscator.io: string-array + property/numeric decoders, per-build renaming) — detect decoders
-  by *shape*, not name, so you survive rebuilds; see `jsdeobf/` in this repo (DAG of passes to a
-  fixpoint, sandboxed V8 eval, cross-file decoder resolution, member-fold, DCE). **(b) custom VM /
+  by *shape*, not name, so you survive rebuilds; build a DAG of passes run to a fixpoint (sandboxed
+  V8 eval, cross-file decoder resolution, member-fold, dead-code elimination). **(b) custom VM /
   control-flow flattening** (Kasada, parts of Akamai) — recover the dispatch table and opcode
   handlers; substantially more work; consider dynamic tracing over static rewriting.
 - **C2 · If there's WASM.** Extract any runtime string table by **executing the real glue+WASM in a
@@ -119,6 +120,74 @@ every target has WASM, a challenge, or a token.
   values, or render with real native libs) but it is a fidelity arms race against server-side
   scoring — which is exactly why piloting a real browser (perfect fidelity, free) usually wins on
   cost. The conclusion to reach is a **capability tier**, not "possible/impossible" (see below).
+
+## Hard-to-emulate surfaces: recognize, evaluate, source from a real browser
+
+When an offline replica is the goal, the cost concentrates in a few surfaces whose values you cannot
+cheaply fabricate. Find them, rate them, and decide which to satisfy with a real browser instead of
+synthesizing.
+
+**Why a surface is hard.** It is expensive to emulate when its output depends on the real machine and
+the server can tell. Rate each surface on:
+
+- **Hardware-derived output** — produced by the GPU, audio DSP, or codecs, and varies by
+  driver/renderer/OS (canvas, WebGL, audio). Synthetic values rarely match any real population.
+- **Synchronous read** — the client reads it inline during execution, so there is no lazy hook point
+  to inject a value computed elsewhere without intercepting the exact call.
+- **Internal consistency** — the value is cross-checked against the rest of the profile. A UA that
+  claims macOS must pair with an Apple WebGL renderer, a matching DPR/screen, a plausible font set.
+  One faked value that does not agree with the others is the tell.
+- **Server-side scoring against a known-good corpus** — the vendor compares your value to a
+  population of real ones. Novel or software-renderer values score as bot even if internally valid.
+- **Dynamic / per-challenge input** — the server dictates *what* to render or compute this session
+  (a string to draw, a shader to run, a nonce to hash), so any previously captured value is stale.
+
+High on several of these means source it live from a real browser. Low on all means synthesize or
+replay a captured value.
+
+**Per-surface read:**
+
+- **Canvas 2D (text + geometry)** — renderer- and font-stack-dependent anti-aliasing. Moderate to
+  hard, and the *content is often dynamic* (server-specified text/shapes), which kills static replay.
+  Render live in a real engine per challenge.
+- **WebGL / shaders** — `UNMASKED_RENDERER` and `VENDOR`, plus `readPixels` of a rendered scene.
+  GPU/driver/ANGLE-backend specific. Hard. Software fallback (SwiftShader, llvmpipe) is itself a bot
+  signal, so you need a real GPU or a real browser on real hardware.
+- **Audio (`OfflineAudioContext`)** — oscillator → compressor → `getChannelData` sum. Float-path and
+  build dependent but stable per engine build. Moderate; capture once per (browser build, OS) and
+  replay if the server does not vary the graph.
+- **Fonts / `measureText` / enumeration** — installed fonts plus rasterizer. Moderate; stable per
+  machine, so capture-and-reuse works unless it is cross-checked against the UA/platform.
+- **Media codecs (`canPlayType`), WebRTC, `getClientRects`, plugins** — enumerable and mostly static.
+  Easy to mirror from one captured real profile.
+- **Timing, `performance.now` jitter, GC behavior** — behavioral, usually scored loosely. Easy to
+  approximate.
+
+**Approaches to source the hard surfaces from a real browser:**
+
+- **Full pilot (default).** Run the genuine client in a real browser on real hardware. Every surface
+  is authentic and self-consistent with no extra work; heaviest per request (Phase B).
+- **Hybrid render-and-inject.** Keep the cheap pipeline headless/offline, and stand up a real browser
+  as a *rendering oracle* for the hard surface only: feed it the server's challenge input (the
+  text/shader/params), let it produce the canvas/WebGL/audio value on real hardware, capture the
+  value, and inject it at the exact call site in your emulated client. Worth it only when the hard
+  surface is small and well isolated and the rest of the pipeline is cheap to run.
+- **Capture-and-replay.** For *static* surfaces (no per-session variation), record the real value
+  once per (browser build, OS, GPU) and reuse it. Confirm with the negative control that the server
+  is not varying the input; if it is, the replay is stale and you must render live.
+- **Real-GPU configuration.** Headless Chrome defaults to SwiftShader. For authentic GPU output, run
+  headed on a GPU box, run headless with GPU enabled and the right ANGLE backend
+  (`--use-angle=metal`/`d3d11`/`gl`), or `puppeteer.connect` to a real desktop Chrome. Match the
+  GPU/driver to the device profile you are claiming.
+- **Remote real browsers / farms.** A pool of real (or real-GPU) browsers behind an emulated front
+  end gives throughput. Rotate device profiles and proxies so the authentic fingerprints do not
+  cluster on one machine.
+
+**The call that decides everything:** is the hard surface's *input* dynamic? If the server fixes what
+to render or compute each session (common for canvas-text and shader challenges), captured values are
+stale and you need a live real engine per request. If the input is static, capture a profile once and
+replay. Make this determination early, with the negative control, because it sets whether you are
+running a browser per request or just a one-time capture.
 
 ## The decisive constraint (why a real engine is the cheap path)
 
@@ -140,7 +209,7 @@ positive.
 
 ## Tools
 - JS: `tree-sitter` + `tree-sitter-javascript`, a V8 sandbox (`mini-racer`) for safe decoder eval,
-  `jsbeautifier`; the `jsdeobf/` toolkit here for the string-array family.
+  `jsbeautifier`; a DAG-based pass pipeline for the string-array family.
 - WASM: `wabt` + `wasm-tools` (`brew install wabt wasm-tools`); Node `vm` + native
   `WebAssembly`/`TextDecoder`/`webcrypto` for the offline harness.
 - Piloting: `puppeteer`/`playwright` (+ `puppeteer-extra-plugin-stealth`); prefer
