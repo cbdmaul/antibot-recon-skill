@@ -257,21 +257,41 @@ positive.
 ## From recon to a system: complexity ladder and architecture
 
 The recon output is a per-target *profile*: the credential, its transport, the endpoints, which
-device surfaces and behaviors are checked, and whether each is **static or dynamic**. That profile
-drives one decision — how much real browser you must spend per request. Build the system around that
-decision, not around a single technique.
+device surfaces and behaviors are checked, and whether each is **static or dynamic**. Solve exactly
+what the profile shows. The expensive axis — generating an accepted credential — is separate from two
+cheaper, orthogonal axes — transport fidelity and scale. Conflating them is how you end up building a
+browser farm to beat a site whose only defense is a TLS fingerprint.
 
-**Complexity ladder (vendor defense observed → what the system must do).** Each tier is a superset of
-the ones below. Find your target's highest checked tier in recon, build up to it, and no further.
+**Credential ladder (the main axis).** This is what most of the recon is about: producing one accepted
+credential. Each tier is a superset of the ones below. Build to the highest tier recon found, no
+further.
 
-| Tier | Defense observed in recon | What the system must do | Component |
+| Tier | Credential defense in recon | What the system must do | Component |
 |---|---|---|---|
-| L0 | static credential, no JS | send the credential | HTTP client + credential cache |
-| L1 | credential derived by simple JS, no hardware FP | run the derivation offline | JS-sandbox runner (`mini-racer`/node `vm`) |
-| L2 | device fingerprint required, **static** challenge input | inject a captured real profile | profile store + emulated runner |
-| L3 | **dynamic** per-session challenge, real-GPU FP | render the hard surface live | real-browser oracle (hybrid) or full pilot |
-| L4 | behavioral scoring and/or automation detection | supply plausible behavior, hide hooks | behavior engine + stealthed real browser |
-| L5 | origin binding + TLS/JA3 + header order + rate-limit/clustering | distribute over real browsers on the allowed origin, rotate identities | browser pool + proxy/profile rotation + browser-TLS |
+| C0 | none, or a static credential | send the request | HTTP client |
+| C1 | credential derived by simple JS, no hardware FP | run the derivation offline | JS-sandbox runner (`mini-racer`/node `vm`) |
+| C2 | device fingerprint required, **static** challenge input | inject a captured real profile | profile store + emulated runner |
+| C3 | **dynamic** per-session challenge, real-GPU FP | render the hard surface live | real-browser oracle (hybrid) or full pilot |
+| C4 | behavioral scoring or automation detection that **gates** the credential | supply plausible behavior, hide hooks | behavior engine + stealthed real browser |
+
+**Two orthogonal axes — add only if recon shows them, at whatever credential tier you are on.** These
+are not higher tiers. They are usually cheap, and either one can be the *entire* defense.
+
+- **Transport fidelity** — TLS/JA3/JA4, HTTP/2 settings, header order. If the edge fingerprints the
+  connection, a plain HTTP client is rejected before any JS runs. Match it with a browser-TLS
+  impersonation client (`curl-impersonate`, `utls`, `tls-client`) and correct header order. It is
+  cheap, independent of credential complexity, and a real browser supplies it for free. **If
+  transport fingerprinting is the only defense (no JS/cookie/token challenge), that is the whole job —
+  use an impersonation client, not a browser.**
+- **Scale and identity** — origin binding, single-use nonces, rate-limit/clustering. Origin binding is
+  cheap: send the allowed `Origin`/host and the right cookies. Single-use nonces mean one credential
+  per request, never replayed. Rate-limit and fingerprint-clustering matter only when you need
+  *volume*; then add proxy rotation and a pool of device profiles so authentic identities do not
+  cluster on one host. None of this changes how a single credential is generated.
+
+The triage principle holds: defeat only what the target checks. A site protected by JA3 alone needs a
+TLS-impersonation client, not a browser. A WASM challenge with no transport check needs a real browser
+but no impersonation. Do not pay for an axis the target does not use.
 
 **Decision flow (per request).**
 
@@ -279,26 +299,22 @@ the ones below. Find your target's highest checked tier in recon, build up to it
  recon profile
       │
       ▼
- credential static? ───────────────yes──► HTTP replay                      (L0/L1)
-      │ no
-      ▼
- device FP needed? ────────────────no───► JS-sandbox derive                (L1)
+ JS / cookie / token credential challenge?
+      │ no ──► transport fingerprinted? ──yes──► TLS-impersonation HTTP client   (done)
+      │                                  ──no───► plain HTTP client              (done)
       │ yes
       ▼
- challenge input dynamic? ─────────no───► emulated runner + captured FP    (L2)
-      │ yes
-      ▼
- behavior / automation scored? ───no───► real-browser render or pilot      (L3)
-      │ yes
-      ▼
- real browser + behavior engine + stealth                                  (L4)
-      │
-      ▼  (always, for scale + origin/TLS binding)
- assign device profile + proxy from pool; keep the credential step and the
- protected request in one context                                          (L5)
+ pick the highest credential tier recon found:
+   C1 JS-sandbox derive · C2 emulated + captured FP · C3 real-browser render/pilot · C4 + behavior/stealth
       │
       ▼
- control harness verifies acceptance ──BLOCK──► escalate tier / rotate profile / re-capture / re-triage
+ transport fingerprinted?  ──yes──► add an impersonation client   (free inside a real browser)
+      │
+      ▼
+ need volume?  ──yes──► proxy + device-profile rotation; keep credential step and protected request in one context
+      │
+      ▼
+ control harness verifies acceptance ── BLOCK ──► escalate credential tier / fix transport / rotate / re-triage
 ```
 
 **Code layout.**
@@ -312,15 +328,16 @@ antibot-defeat/
     surfaces.json               # device surfaces + behaviors checked, each static|dynamic
   targets/<vendor>/profile.json # the contract the runtime consumes
   core/
-    orchestrator/               # reads profile, picks the tier/runner per request
+    orchestrator/               # reads profile, picks the credential tier + which axes apply
     runners/
-      http/                     # L0-L1: replay + JS-sandbox credential derivation
-      emulated/                 # L2: offline client with injected captured fingerprint
-      browser/                  # L3-L5: real-browser pilot and rendering oracle
+      http/                     # C0-C1: replay + JS-sandbox credential derivation
+      emulated/                 # C2: offline client with injected captured fingerprint
+      browser/                  # C3-C4: real-browser pilot and rendering oracle
     fingerprint/                # capture, consistency-check, and serve device profiles
     behavior/                   # mouse/key/touch synthesis and human-session replay
     challenge/                  # parse the server challenge; route hard surfaces to the oracle
-    transport/                  # TLS-impersonation, header-order, proxy rotation
+    transport/                  # ORTHOGONAL: TLS-impersonation + header-order (skip when piloting a browser)
+    scale/                      # ORTHOGONAL: proxy + device-profile rotation (only for volume)
   pool/                         # warm real(-GPU) browsers; bind profile + proxy per session
   control/                      # negative-control + acceptance verification, run continuously
   store/                        # captured profiles, recorded sessions, single-use credential cache
@@ -328,16 +345,19 @@ antibot-defeat/
 
 **Design rules that fall out of the recon.**
 
-- The orchestrator is profile-driven. Adding a vendor is writing a new `profile.json`, not new
-  control flow.
+- The orchestrator is profile-driven. Adding a vendor is writing a new `profile.json`, not new control
+  flow.
+- Keep the three axes separate. Many targets need only one. A TLS-only site is a `transport/` job at
+  C0, with no browser anywhere.
 - Whenever a tier uses a real browser, keep the credential step and the protected request in one
-  context so `Origin`, cookies, and TLS/JA3 are the engine's for free.
+  context so `Origin`, cookies, and TLS/JA3 are the engine's for free — transport fidelity is then not
+  a component you build, it is a side effect.
 - Treat single-use nonces as a cache-invalidation rule: one credential per protected request, never
   replayed.
 - The control harness is a runtime component, not a one-off test. Acceptance drift is how you learn
   the vendor shipped a new build, which re-triggers recon for that target.
-- Cost scales with tier. L0-L2 are cheap and parallel; L3+ spends a real browser. Hold each target at
-  the lowest tier its profile allows, and re-evaluate when a rebuild changes the profile.
+- Cost scales with the credential tier, not with the orthogonal axes. C0-C2 are cheap and parallel;
+  C3+ spends a real browser. Hold each target at the lowest credential tier its profile allows.
 
 ## What you'll conclude
 
